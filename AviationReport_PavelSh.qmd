@@ -1,0 +1,949 @@
+---
+title: "Arrival delays and flight cancellations"
+subtitle: "US reporting carriers, January 2025"
+author: "Pavel Šorohhov"
+lang: en
+format:
+  html:
+    theme: cosmo
+    toc: true
+    toc-depth: 2
+    toc-title: "In this report"
+    code-fold: true
+    code-summary: "Show original R code"
+    code-tools: true
+    embed-resources: true
+    fig-format: png
+    fig-dpi: 160
+    include-in-header:
+      text: |
+        <style>
+        body { color: #23313d; background: #fbfcfd; }
+        #title-block-header { border-bottom: 3px solid #245d78; padding-bottom: 1.4rem; margin-bottom: 2rem; }
+        #title-block-header .title { font-weight: 700; letter-spacing: -.025em; }
+        h2 { color: #17445e; margin-top: 2.5rem; }
+        h3 { color: #245d78; }
+        .table { font-size: .92rem; }
+        .table thead { border-bottom: 2px solid #245d78; }
+        .table tbody tr:nth-child(even) { background: #f1f5f8; }
+        .quarto-figure { margin: 1.8rem 0 2.2rem; }
+        details > summary { color: #245d78; cursor: pointer; }
+        .sourceCode { font-size: .85rem; }
+        </style>
+execute:
+  echo: true
+  warning: false
+  message: false
+  error: false
+fig-width: 9
+fig-height: 4.8
+---
+
+## Research questions
+
+This project examines the complete January 2025 reporting-carrier file from the US Bureau of Transportation Statistics (BTS). R is used for the arrival-delay analysis, and DuckDB SQL in DBeaver is used to investigate cancellations for OH.
+
+1. How do arrival delays vary by day and across reporting airlines?
+2. Does the difference between UA and WN persist when comparing shared directional routes?
+3. How concentrated are OH cancellations in particular days and origin airports, and which cancellation reasons were reported?
+
+The results describe this file and this month. They do not establish an airline's performance across all periods.
+
+## Data and preparation
+
+The original file is `On_Time_Reporting_Carrier_On_Time_Performance_(1987_present)_2025_1.csv`. It is stored in the project's `data` folder and contains 539,747 flight records for January 1-31, 2025.
+
+The R and SQL blocks below retain the original analysis code. In HTML, expand **Show original R code** or **Show original SQL** to inspect it. The PDF presents the results. Package installation and `View()` commands remain in the source but are not executed during rendering.
+
+```{r}
+#| label: "load-data"
+# Load the original BTS dataset
+flights <- read.csv("data/On_Time_Reporting_Carrier_On_Time_Performance_(1987_present)_2025_1.csv")
+```
+
+```{r}
+#| label: "install-tidyverse"
+#| eval: false
+# Packages install
+install.packages("tidyverse")
+```
+
+```{r}
+#| label: "load-tidyverse"
+library(tidyverse)
+```
+
+```{r}
+#| label: "install-gapminder"
+#| eval: false
+install.packages("gapminder")
+```
+
+```{r}
+#| label: "load-gapminder"
+library(gapminder)
+```
+
+```{r}
+#| label: "table-overview"
+#| output: false
+# Table overview
+summary(flights)
+names(flights)
+head(flights)
+```
+
+### Missing values and date range
+
+The original checks show no missing values in `Cancelled` or `Diverted`. `ArrDelay` has missing values, which are excluded from the arrival-delay analysis. After that filtering step, `na.rm = TRUE` is not needed for calculations using `arrivals$ArrDelay`.
+
+```{r}
+#| label: "missing-values"
+# Are there any NA
+summary(flights$Cancelled)
+summary(flights$Diverted)
+summary(flights$ArrDelay)
+```
+
+```{r}
+#| label: "convert-date"
+#| output: false
+flights$FlightDate <- as.Date(flights$FlightDate)
+head(flights)
+```
+
+```{r}
+#| label: "date-range"
+print(range(flights$FlightDate, na.rm = TRUE))
+```
+
+Cancellation rates use all flight records in the selected group. Arrival-delay rates use only completed, non-diverted flights with a known arrival delay. A delayed arrival means `ArrDelay >= 15`. Negative `ArrDelay` values indicate early arrivals. These denominators are different, so a low arrival-delay rate does not by itself imply a low cancellation rate.
+
+## Monthly overview
+
+```{r}
+#| label: "monthly-overview"
+# Month overview
+overview <- flights |>
+  summarise(total_flights = n(),
+            cancelled_flights = sum(Cancelled == 1),
+            cancelled_pct = 100 * mean(Cancelled == 1),
+            diverted_flights = sum(Diverted == 1))
+print(overview)
+```
+
+There were **16,312 cancellations (3.02%)** and **1,166 diversions** among 539,747 flight records.
+
+```{r}
+#| label: "arrival-summary"
+# In BTS documentation, there is a 15-min delay threshold
+# Select completed non-diverted flights with known arrival delay
+arrivals <- flights |>
+  filter(Cancelled == 0,
+         Diverted == 0,
+         !is.na(ArrDelay))
+summary(arrivals$ArrDelay)
+# Delays
+#arrdelay = arrival delay
+delay_summary <- arrivals |>
+  summarise(flights_n = n(),
+            delayed_15_pct = 100 * mean(ArrDelay >= 15),
+            mean_arrdelay_min = mean(ArrDelay),
+            median_arrdelay_min = median(ArrDelay))
+print(delay_summary)
+# Mean and median include early arrivals.
+# This shows the schedule deviation for all flights in the selected group,
+# not just the average duration of delays.
+```
+
+Among **522,269 eligible arrivals**, **18.79%** were at least 15 minutes late. The mean signed arrival delay was **3.76 minutes**, while the median was **-8 minutes**.
+
+The negative median indicates that at least half of eligible flights arrived eight minutes early or earlier. Long positive delays pull the mean upward. The mean here describes deviation from the schedule across eligible arrivals, including early arrivals; it is not the average delay among delayed flights only.
+
+### Daily arrival delays
+
+```{r}
+#| label: "daily-delays"
+# The share of delayed arrivals is calculated for each day
+daily_delays <- arrivals |>
+  group_by(FlightDate) |>
+  summarise(flights_n = n(),
+            delayed_pct = 100 * mean(ArrDelay >= 15))
+```
+
+```{r}
+#| label: "fig-daily-delays"
+#| fig-cap: "Each daily percentage uses the eligible arrivals on that day."
+#| fig-alt: "Daily percentages of eligible flights arriving at least fifteen minutes late in January 2025."
+# The first graph will show in which had more frequent delays
+p <- ggplot(daily_delays, aes(x = FlightDate, y = delayed_pct)) +
+  geom_line(color = "steelblue") +
+  geom_point(color = "steelblue") +
+  labs(title = "Arrival delays by day - January 2025",
+       subtitle = "Completed non-diverted flights",
+       x = "Date",
+       y = "Arrivals with the delay of 15+ min, %") +
+  theme_minimal()
+print(p)
+```
+
+### Arrival-delay distribution
+
+```{r}
+#| label: "arrival-percentiles"
+# Examine the arrival delay distribution
+arrival_percentiles <- quantile(arrivals$ArrDelay,
+                               probs = c(0.50, 0.75, 0.90, 0.95, 0.99))
+print(arrival_percentiles)
+```
+
+The 90th percentile was 37 minutes, the 95th percentile was 74 minutes, and the 99th percentile was 205 minutes. These values describe the upper tail of the signed arrival-delay distribution.
+
+```{r}
+#| label: "delay-details"
+# Measure early arrivals and long delays
+delay_details <- arrivals |>
+  summarise(early_arrivals_pct = 100 * mean(ArrDelay < 0),
+            delayed_60plus_pct = 100 * mean(ArrDelay >= 60),
+            delayed_180plus_pct = 100 * mean(ArrDelay >= 180),
+            mean_delay_among_delayed_min = mean(ArrDelay[ArrDelay >= 15]))
+print(delay_details)
+```
+
+**65.44%** of eligible arrivals were early. **6.37%** were at least 60 minutes late, and **1.28%** were at least 180 minutes late. Among flights delayed by at least 15 minutes, the mean arrival delay was **70.76 minutes**.
+
+## Comparing airlines
+
+### All reporting airlines
+
+The table combines cancellation rates from all scheduled-flight records with arrival-delay rates from eligible arrivals. Percentages are rounded to two decimal places in the original airline summary code.
+
+```{r}
+#| label: "airline-comparison"
+#| output: false
+# Airline comparison
+# How do cancellation and arrival delay rates vary across airlines?
+# Do arrival delay differences persist when comparing the same routes?
+
+# Calculate flight totals and cancellation rates
+airline_totals <- flights |>
+  group_by(Reporting_Airline) |>
+  summarise(total_flights = n(),
+            cancelled_pct = round(100 * mean(Cancelled == 1), 2))
+
+# Calculate arrival delay rates
+airline_delays <- arrivals |>
+  group_by(Reporting_Airline) |>
+  summarise(arrival_flights = n(),
+            delayed_15_pct = round(100 * mean(ArrDelay >= 15), 2),
+            delayed_60_pct = round(100 * mean(ArrDelay >= 60), 2))
+print(airline_delays, n = Inf)
+
+# Combine the summaries using the airline code
+airline_comparison <- airline_totals |>
+  left_join(airline_delays, by = "Reporting_Airline") |>
+  arrange(desc(delayed_15_pct))
+
+# Display all rows and columns
+print(airline_comparison, n = Inf, width = Inf)
+```
+
+```{r}
+#| label: "view-airline-comparison"
+#| eval: false
+# Table of the airline comparison
+View(airline_comparison)
+```
+
+| Airline | Scheduled flights | Cancelled (%) | Eligible arrivals | Delayed 15+ (%) | Delayed 60+ (%) |
+| --- | --- | --- | --- | --- | --- |
+| F9 | 15,526 | 2.52 | 15,110 | 25.98 | 9.99 |
+| OH | 21,094 | 9.00 | 19,151 | 25.48 | 10.69 |
+| B6 | 17,918 | 1.80 | 17,558 | 24.46 | 7.63 |
+| G4 | 9,345 | 1.27 | 9,206 | 23.71 | 9.25 |
+| OO | 65,036 | 2.07 | 63,502 | 20.88 | 8.59 |
+| DL | 76,306 | 2.80 | 74,025 | 19.32 | 7.27 |
+| AA | 75,088 | 3.73 | 72,082 | 19.23 | 6.75 |
+| MQ | 21,890 | 4.71 | 20,831 | 18.43 | 6.55 |
+| NK | 17,544 | 3.26 | 16,946 | 18.08 | 5.25 |
+| UA | 62,007 | 1.92 | 60,668 | 17.63 | 5.55 |
+| AS | 18,163 | 1.34 | 17,847 | 17.58 | 3.92 |
+| YX | 27,833 | 4.02 | 26,683 | 16.02 | 4.53 |
+| WN | 105,307 | 2.86 | 102,120 | 15.21 | 3.91 |
+| HA | 6,690 | 1.91 | 6,540 | 13.55 | 4.19 |
+
+UA's arrival-delay rate was **17.63%**, compared with **15.21%** for WN, a difference of approximately **2.42 percentage points**. These totals combine different route networks. OH had the highest cancellation rate in this table, **9.00%**, motivating the SQL investigation below.
+
+### UA and WN on shared routes
+
+Routes are directional: an origin-destination pair is distinct from the reverse pair. A route is included only if both UA and WN have at least 30 eligible arrivals on it during the month. Each retained route receives equal weight in the route summary.
+
+```{r}
+#| label: "shared-routes"
+# Calculate delay rates by airline and directional route
+route_delays <- arrivals |>
+  filter(Reporting_Airline %in% c("UA", "WN")) |>
+  group_by(Reporting_Airline, Origin, Dest) |>
+  summarise(flights_n = n(),
+            delayed_pct = 100 * mean(ArrDelay >= 15),
+            .groups = "drop") |>
+  filter(flights_n >= 30)
+
+# Prepare United Airlines (UA) route statistics
+ua_routes <- route_delays |>
+  filter(Reporting_Airline == "UA") |>
+  select(Origin, Dest, ua_flights = flights_n,
+         ua_delayed_pct = delayed_pct)
+
+# Prepare Southwest Airlines (WN) route statistics
+wn_routes <- route_delays |>
+  filter(Reporting_Airline == "WN") |>
+  select(Origin, Dest, wn_flights = flights_n,
+         wn_delayed_pct = delayed_pct)
+
+# Compare airlines on shared routes
+route_comparison <- ua_routes |>
+  inner_join(wn_routes, by = c("Origin", "Dest")) |>
+  mutate(delay_gap_pp = ua_delayed_pct - wn_delayed_pct) |>
+  arrange(desc(delay_gap_pp))
+
+# Check the number of shared routes
+print(nrow(route_comparison))
+```
+
+```{r}
+#| label: "view-route-comparison"
+#| eval: false
+# Comparison table
+View(route_comparison)
+# Positive delay_gap_pp means a higher arrival delay rate for UA
+```
+
+```{r}
+#| label: "route-summary"
+#| output: false
+# Does the difference between UA and WN persist on shared routes?
+# Summarise differences with equal weight for each route
+route_summary <- route_comparison |>
+  summarise(
+    shared_routes = n(),
+    ua_higher_delay_routes = sum(delay_gap_pp > 0),
+    wn_higher_delay_routes = sum(delay_gap_pp < 0),
+    equal_delay_routes = sum(delay_gap_pp == 0),
+    ua_mean_route_delay_pct = mean(ua_delayed_pct),
+    wn_mean_route_delay_pct = mean(wn_delayed_pct),
+    mean_gap_pp = mean(delay_gap_pp))
+print(route_summary, width = Inf)
+
+# In the aggregate table, UA's delay rate is 2.42 percentage points higher.
+# However, after switching to the selected shared routes with equal weighting,
+# the difference shrinks to just about 0.15 points in the opposite direction.
+# This indicates that the comparison results heavily depend on the choice of routes and the calculation method.
+```
+
+| Original summary measure | Result |
+| --- | --- |
+| Shared routes | 139 |
+| Routes with a higher delay rate for UA | 64 |
+| Routes with a higher delay rate for WN | 74 |
+| Routes with equal rates | 1 |
+| UA mean route delay rate | 19.45% |
+| WN mean route delay rate | 19.60% |
+| Mean gap: UA minus WN | -0.15 percentage points |
+
+On the selected shared routes with equal route weights, UA's mean delay rate was about **0.15 percentage points lower** than WN's. This differs from the all-route, flight-weighted comparison. Both the route selection and the weighting change, so this result does not isolate a causal airline effect. The full 139-route table is included in the appendix.
+
+```{r}
+#| label: "fig-route-gaps"
+#| fig-cap: "Positive differences mean a higher delay rate for UA. Each shared route contributes one observation."
+#| fig-alt: "Histogram of UA minus WN delay-rate differences across the 139 shared routes, with a dashed line at zero."
+# Plot the distribution of route-level delay rate differences
+route_gap_plot <- ggplot(route_comparison,
+  aes(x = delay_gap_pp)) +
+  geom_histogram(binwidth = 5,
+                 boundary = 0,
+                 fill = "steelblue",
+                 color = "white") +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  labs(title = "Arrival delay differences on shared routes",
+       subtitle = "UA vs WN | January 2025",
+       x = "Delay rate difference: UA minus WN (percentage points)",
+       y = "Number of routes",
+       caption = "At least 30 eligible arrivals per airline per route.") +
+  theme_minimal()
+print(route_gap_plot)
+```
+
+### Sensitivity to the minimum number of flights
+
+```{r}
+#| label: "threshold-check"
+# Now, let's check how sensitive the results are to the chosen threshold of 30 flights
+# Select routes with higher flight counts
+routes_60 <- route_comparison |>
+  filter(ua_flights >= 60, wn_flights >= 60)
+routes_100 <- route_comparison |>
+  filter(ua_flights >= 100, wn_flights >= 100)
+
+# Compare results across minimum flight thresholds
+threshold_check <- data.frame(
+  min_flights_per_airline = c(30, 60, 100),
+  shared_routes = c(nrow(route_comparison),
+                   nrow(routes_60),
+                   nrow(routes_100)),
+  mean_gap_pp = c(mean(route_comparison$delay_gap_pp),
+                  mean(routes_60$delay_gap_pp),
+                  mean(routes_100$delay_gap_pp)))
+print(threshold_check)
+
+# With equal weights on the selected shared routes, UA's average delay share is slightly lower.
+# However, the size of the gap varies with the specific set of routes.
+# Therefore, the outcome for shared routes does not stem exclusively from the 30-flight threshold.
+```
+
+The average UA-minus-WN gap remains negative at the 30-, 60-, and 100-flight thresholds. Its magnitude changes as the retained route set becomes smaller. The direction in this check therefore does not depend exclusively on choosing 30 flights; the check does not establish statistical significance.
+
+### Daily comparison on the selected shared routes
+
+The following comparison uses the same monthly set of 139 shared routes. Each daily rate is calculated from the eligible flights for that airline and day. It is flight-weighted within each day, whereas the preceding monthly route summary gives every route equal weight.
+
+```{r}
+#| label: "daily-airline-delays"
+# Next, examine how arrival delay rates change during the month.
+# Compare UA and WN on the 139 shared routes selected earlier.
+# Each daily percentage is calculated from the eligible flights that day.
+
+daily_airline_delays <- arrivals |>
+  filter(Reporting_Airline %in% c("UA", "WN")) |>
+  inner_join(route_comparison, by = c("Origin", "Dest")) |>
+  group_by(FlightDate, Reporting_Airline) |>
+  summarise(flights_n = n(),
+            delayed_pct = 100 * mean(ArrDelay >= 15),
+            .groups = "drop")
+```
+
+```{r}
+#| label: "fig-daily-airlines"
+#| fig-height: 6
+#| fig-cap: "The two panels use the same vertical scale. Daily route mixes and numbers of flights may differ between the airlines."
+#| fig-alt: "Separate aligned panels for UA and WN showing daily delay rates on the selected shared routes."
+# Show each airline in a separate panel
+daily_airline_plot <- ggplot(daily_airline_delays,
+                            aes(x = FlightDate, y = delayed_pct)) +
+  geom_line(color = "steelblue") +
+  geom_point(color = "steelblue") +
+  facet_wrap(~ Reporting_Airline, ncol = 1) +
+  labs(title = "Daily arrival delay rates: UA and WN",
+       subtitle = "January 2025 | Flights on 139 shared routes",
+       x = "Date",
+       y = "Arrivals delayed by 15+ minutes (%)") +
+  theme_minimal()
+print(daily_airline_plot)
+```
+
+## SQL investigation: OH cancellations
+
+These are the original DuckDB queries used in DBeaver. Their results are recorded as ordinary tables in this report; Quarto does not execute the SQL blocks or open the DBeaver database. The import statement retains the original local file path.
+
+<details class="code-fold">
+<summary>Show original SQL</summary>
+
+```sql
+CREATE TABLE flights AS
+SELECT *
+FROM read_csv(
+    '/Users/s1pavel/Desktop/Aviation Analytics/data/On_Time_Reporting_Carrier_On_Time_Performance_(1987_present)_2025_1.csv',
+    header = true,
+    sample_size = -1);
+```
+
+</details>
+
+<details class="code-fold">
+<summary>Show original SQL</summary>
+
+```sql
+-- Check the number of imported flights
+SELECT COUNT(*) AS total_flights
+FROM flights;
+```
+
+</details>
+
+| total_flights |
+| --- |
+| 539,747 |
+
+<details class="code-fold">
+<summary>Show original SQL</summary>
+
+```sql
+-- Check the date range
+SELECT
+    MIN(FlightDate) AS first_date,
+    MAX(FlightDate) AS last_date
+FROM flights;
+```
+
+</details>
+
+| first_date | last_date |
+| --- | --- |
+| 2025-01-01 | 2025-01-31 |
+
+<details class="code-fold">
+<summary>Show original SQL</summary>
+
+```sql
+-- Calculate the overall cancellation rate
+SELECT
+    COUNT(*) AS total_flights,
+    SUM(Cancelled) AS cancelled_flights,
+    ROUND(100.0 * SUM(Cancelled) / COUNT(*), 2) AS cancelled_pct
+FROM flights;
+```
+
+</details>
+
+| total_flights | cancelled_flights | cancelled_pct |
+| --- | --- | --- |
+| 539,747 | 16,312 | 3.02 |
+
+The SQL total and cancellation rate agree with the R monthly overview.
+
+### Daily cancellation rates
+
+The query orders OH's days by cancellation rate. The three highest rates occurred on **January 30, January 10, and January 6**. All 31 daily results are included here.
+
+<details class="code-fold">
+<summary>Show original SQL</summary>
+
+```sql
+-- Calculate daily cancellation rates for OH
+SELECT
+    FlightDate,
+    COUNT(*) AS total_flights,
+    SUM(Cancelled) AS cancelled_flights,
+    ROUND(100.0 * SUM(Cancelled) / COUNT(*), 2) AS cancelled_pct
+FROM flights
+WHERE Reporting_Airline = 'OH'
+GROUP BY FlightDate
+ORDER BY cancelled_pct DESC;
+```
+
+</details>
+
+| Date | Scheduled flights | Cancelled flights | Cancelled (%) |
+| --- | --- | --- | --- |
+| 2025-01-30 | 724 | 314 | 43.37 |
+| 2025-01-10 | 713 | 262 | 36.75 |
+| 2025-01-06 | 706 | 235 | 33.29 |
+| 2025-01-31 | 714 | 215 | 30.11 |
+| 2025-01-22 | 672 | 170 | 25.30 |
+| 2025-01-11 | 590 | 91 | 15.42 |
+| 2025-01-21 | 652 | 99 | 15.18 |
+| 2025-01-09 | 724 | 102 | 14.09 |
+| 2025-01-23 | 724 | 92 | 12.71 |
+| 2025-01-19 | 662 | 80 | 12.08 |
+| 2025-01-07 | 651 | 64 | 9.83 |
+| 2025-01-05 | 703 | 62 | 8.82 |
+| 2025-01-20 | 712 | 35 | 4.92 |
+| 2025-01-24 | 713 | 30 | 4.21 |
+| 2025-01-29 | 671 | 25 | 3.73 |
+| 2025-01-12 | 696 | 11 | 1.58 |
+| 2025-01-04 | 650 | 4 | 0.62 |
+| 2025-01-25 | 590 | 3 | 0.51 |
+| 2025-01-08 | 672 | 3 | 0.45 |
+| 2025-01-15 | 672 | 2 | 0.30 |
+| 2025-01-16 | 724 | 0 | 0.00 |
+| 2025-01-18 | 580 | 0 | 0.00 |
+| 2025-01-17 | 713 | 0 | 0.00 |
+| 2025-01-03 | 707 | 0 | 0.00 |
+| 2025-01-14 | 652 | 0 | 0.00 |
+| 2025-01-26 | 696 | 0 | 0.00 |
+| 2025-01-27 | 712 | 0 | 0.00 |
+| 2025-01-28 | 652 | 0 | 0.00 |
+| 2025-01-13 | 712 | 0 | 0.00 |
+| 2025-01-02 | 706 | 0 | 0.00 |
+| 2025-01-01 | 629 | 0 | 0.00 |
+
+### Three peak days compared with the rest of the month
+
+<details class="code-fold">
+<summary>Show original SQL</summary>
+
+```sql
+-- Compare the three peak days (06.01, 30.01, 10.01) with the rest of the month
+SELECT
+    CASE
+        WHEN FlightDate IN ('2025-01-06', '2025-01-10', '2025-01-30')
+            THEN 'Three peak days'
+        ELSE 'Other days'
+    END AS day_group,
+    COUNT(*) AS total_flights,
+    SUM(Cancelled) AS cancelled_flights,
+    ROUND(100.0 * SUM(Cancelled) / COUNT(*), 2) AS cancelled_pct
+FROM flights
+WHERE Reporting_Airline = 'OH'
+GROUP BY day_group
+ORDER BY cancelled_pct DESC;
+
+-- 811 / (811 + 1088) × 100 = 42,71
+-- The three peak days accounted for 42.71% of OH's monthly cancellations
+-- and 10.16% of its scheduled flights.
+```
+
+</details>
+
+| Day group | Scheduled flights | Cancelled flights | Cancelled (%) |
+| --- | --- | --- | --- |
+| Three peak days | 2,143 | 811 | 37.84 |
+| Other days | 18,951 | 1,088 | 5.74 |
+
+The three selected days accounted for **811 of OH's 1,899 monthly cancellations (42.71%)** and **10.16%** of its scheduled flights. Their combined cancellation rate was **37.84%**, compared with **5.74%** on the remaining days.
+
+These dates were selected after inspecting the daily rates. The comparison describes concentration in this month; it is not a test using dates chosen in advance.
+
+### Origin airports during the three peak days
+
+<details class="code-fold">
+<summary>Show original SQL</summary>
+
+```sql
+-- Compare origin airports during the three peak days
+SELECT
+    Origin,
+    COUNT(*) AS total_flights,
+    SUM(Cancelled) AS cancelled_flights,
+    ROUND(100.0 * SUM(Cancelled) / COUNT(*), 2) AS cancelled_pct
+FROM flights
+WHERE Reporting_Airline = 'OH'
+    AND FlightDate IN ('2025-01-06', '2025-01-10', '2025-01-30')
+GROUP BY Origin
+ORDER BY cancelled_flights DESC;
+```
+
+</details>
+
+DCA had the largest number of cancelled OH departures on the selected dates: **259 of 366 flights (70.77%)**. CLT followed with **130 of 493 (26.37%)**. The query ranks airports by the number of cancellations, not by the cancellation percentage. The complete 93-origin result is in the appendix.
+
+### Reported cancellation reasons
+
+<details class="code-fold">
+<summary>Show original SQL</summary>
+
+```sql
+-- Examine reported cancellation reasons on the three peak days
+SELECT
+    FlightDate,
+    CASE CancellationCode
+        WHEN 'A' THEN 'Carrier'
+        WHEN 'B' THEN 'Weather'
+        WHEN 'C' THEN 'National Aviation System'
+        WHEN 'D' THEN 'Security'
+        ELSE 'Unknown / other'
+    END AS cancellation_reason,
+    COUNT(*) AS cancelled_flights
+FROM flights
+WHERE Reporting_Airline = 'OH'
+    AND Cancelled = 1
+    AND FlightDate IN ('2025-01-06', '2025-01-10', '2025-01-30')
+GROUP BY FlightDate, cancellation_reason
+ORDER BY FlightDate, cancelled_flights DESC;
+
+-- Reported cancellation reasons differed across the three peak days.
+-- On January 6, 234 of 235 cancellations were classified as Weather.
+-- On January 10, 259 of 262 cancellations were classified as Weather.
+-- On January 30, 301 of 314 cancellations were classified as Carrier.
+-- These categories do not identify the specific events behind each cancellation.
+```
+
+</details>
+
+| Date | Reported reason | Cancelled flights |
+| --- | --- | --- |
+| 2025-01-06 | Weather | 234 |
+| 2025-01-06 | Carrier | 1 |
+| 2025-01-10 | Weather | 259 |
+| 2025-01-10 | Carrier | 3 |
+| 2025-01-30 | Carrier | 301 |
+| 2025-01-30 | Weather | 13 |
+
+On January 6, **234 of 235** cancellations were classified as Weather. On January 10, **259 of 262** were classified as Weather. On January 30, **301 of 314** were classified as Carrier.
+
+The reported categories differ across the selected dates. They do not identify the specific events behind each cancellation, and a carrier classification alone does not establish a particular operational cause.
+
+## Conclusions and limitations
+
+1. Cancellations affected 3.02% of flight records. Among eligible arrivals, 18.79% were at least 15 minutes late. Early arrivals were common, while long delays pulled the mean above the median.
+2. The UA-WN comparison depends on the route set and the weighting. UA's rate was higher in the all-route comparison, but slightly lower when giving each selected shared route equal weight. The shared-route gap remained negative across the three minimum-flight thresholds.
+3. OH cancellations were concentrated in three days. Weather dominated the reported cancellations on January 6 and 10, while Carrier dominated on January 30.
+
+This is a descriptive analysis of one month. It does not control for departure times, weather exposure, aircraft, or other operating conditions. The arrival-delay comparison excludes cancellations and diversions, which must be considered separately. Small differences should not be treated as proof that one airline is inherently more reliable.
+
+## Reproducing the report
+
+Keep `AviationReport.qmd` in the project folder and the original CSV in its `data` subfolder. Open the project in RStudio, install the packages using the existing installation lines if needed, and render the document as HTML. The HTML can also be printed to PDF.
+
+The original R commands are preserved in their original order. Only Quarto chunk options control whether installation commands, `View()` windows, or large console outputs run or appear during rendering. The three figures are generated by the original plotting code. No extra R analysis or SQL queries are included.
+
+The formatted airline and route tables, SQL tables, and written interpretations are the checked **January 2025** results stored in the document. They do not update automatically if a different dataset is substituted. The executing R chunks and figures do recalculate. SQL is run separately in DBeaver; its import path must match the location of the original CSV on the computer running it. The original `CREATE TABLE` statement is for the initial import into a database without an existing `flights` table.
+
+### Sources
+
+- [BTS January 2025 source archive](https://www.transtats.bts.gov/PREZIP/On_Time_Reporting_Carrier_On_Time_Performance_1987_present_2025_1.zip).
+- [BTS field definitions](https://www.transtats.bts.gov/Fields.asp?gnoyr_VQ=FGJ).
+- [BTS reporting instructions and cancellation codes](https://esubmit.rita.dot.gov/On-Time-Form3B.aspx).
+
+## Appendix: complete detailed results
+
+The following tables contain all rows from the original route comparison and peak-day origin-airport query. Route rates and gaps are displayed to two decimal places; the original R calculations use unrounded route rates.
+
+<details>
+<summary>All 139 shared directional routes</summary>
+
+| Origin | Destination | UA arrivals | UA delayed (%) | WN arrivals | WN delayed (%) | Gap (pp) |
+| --- | --- | --- | --- | --- | --- | --- |
+| JAX | DEN | 37 | 35.14 | 30 | 10.00 | 25.14 |
+| DEN | PSP | 67 | 29.85 | 40 | 10.00 | 19.85 |
+| MIA | DEN | 95 | 24.21 | 32 | 6.25 | 17.96 |
+| MEM | DEN | 60 | 30.00 | 31 | 12.90 | 17.10 |
+| HDN | DEN | 89 | 39.33 | 43 | 23.26 | 16.07 |
+| DEN | ORD | 258 | 31.01 | 101 | 15.84 | 15.17 |
+| MKE | DEN | 31 | 25.81 | 96 | 11.46 | 14.35 |
+| DEN | HDN | 88 | 37.50 | 43 | 23.26 | 14.24 |
+| ORD | LAS | 176 | 16.48 | 31 | 3.23 | 13.25 |
+| DEN | MKE | 31 | 35.48 | 94 | 23.40 | 12.08 |
+| HNL | LAX | 73 | 15.07 | 31 | 3.23 | 11.84 |
+| ORD | AUS | 80 | 27.50 | 31 | 16.13 | 11.37 |
+| DEN | SNA | 122 | 29.51 | 118 | 18.64 | 10.86 |
+| BOI | DEN | 87 | 20.69 | 91 | 9.89 | 10.80 |
+| ORD | DEN | 262 | 17.56 | 101 | 7.92 | 9.64 |
+| LAX | PHX | 86 | 13.95 | 160 | 5.00 | 8.95 |
+| BNA | ORD | 56 | 16.07 | 54 | 7.41 | 8.66 |
+| MCO | DEN | 147 | 26.53 | 160 | 18.12 | 8.41 |
+| BZN | DEN | 120 | 31.67 | 73 | 23.29 | 8.38 |
+| IND | DEN | 61 | 31.15 | 96 | 22.92 | 8.23 |
+| ELP | DEN | 55 | 18.18 | 60 | 10.00 | 8.18 |
+| ORD | BWI | 63 | 19.05 | 54 | 11.11 | 7.94 |
+| AUS | ORD | 80 | 17.50 | 31 | 9.68 | 7.82 |
+| DEN | LAS | 223 | 31.84 | 259 | 24.32 | 7.51 |
+| DEN | LGA | 162 | 27.16 | 116 | 19.83 | 7.33 |
+| RNO | DEN | 102 | 22.55 | 92 | 15.22 | 7.33 |
+| BWI | DEN | 65 | 21.54 | 133 | 14.29 | 7.25 |
+| IAD | DEN | 190 | 21.58 | 62 | 14.52 | 7.06 |
+| LAX | HNL | 71 | 7.04 | 30 | 0.00 | 7.04 |
+| DEN | JAX | 37 | 27.03 | 30 | 20.00 | 7.03 |
+| DEN | COS | 75 | 28.00 | 95 | 21.05 | 6.95 |
+| DEN | RNO | 102 | 28.43 | 93 | 21.51 | 6.93 |
+| DTW | DEN | 62 | 19.35 | 40 | 12.50 | 6.85 |
+| BWI | ORD | 63 | 22.22 | 51 | 15.69 | 6.54 |
+| ABQ | DEN | 62 | 16.13 | 102 | 9.80 | 6.33 |
+| COS | DEN | 75 | 20.00 | 95 | 13.68 | 6.32 |
+| PHL | DEN | 68 | 19.12 | 61 | 13.11 | 6.00 |
+| TUS | DEN | 79 | 11.39 | 99 | 6.06 | 5.33 |
+| SNA | DEN | 124 | 19.35 | 121 | 14.05 | 5.31 |
+| OMA | DEN | 117 | 21.37 | 122 | 16.39 | 4.97 |
+| LAS | DEN | 223 | 18.83 | 259 | 13.90 | 4.93 |
+| DEN | ABQ | 62 | 24.19 | 103 | 19.42 | 4.78 |
+| LAX | BWI | 34 | 11.76 | 38 | 7.89 | 3.87 |
+| RDU | DEN | 62 | 25.81 | 59 | 22.03 | 3.77 |
+| MCI | DEN | 116 | 18.97 | 149 | 15.44 | 3.53 |
+| DEN | SAT | 99 | 28.28 | 104 | 25.00 | 3.28 |
+| STL | DEN | 88 | 19.32 | 149 | 16.11 | 3.21 |
+| GEG | DEN | 68 | 8.82 | 64 | 6.25 | 2.57 |
+| BUR | DEN | 62 | 17.74 | 98 | 15.31 | 2.44 |
+| TPA | DEN | 123 | 18.70 | 98 | 16.33 | 2.37 |
+| MSY | DEN | 100 | 21.00 | 89 | 19.10 | 1.90 |
+| DEN | ONT | 63 | 23.81 | 95 | 22.11 | 1.70 |
+| BOS | DEN | 140 | 13.57 | 67 | 11.94 | 1.63 |
+| GRR | DEN | 62 | 30.65 | 31 | 29.03 | 1.61 |
+| CLE | DEN | 68 | 25.00 | 34 | 23.53 | 1.47 |
+| DEN | MCI | 116 | 21.55 | 153 | 20.26 | 1.29 |
+| DEN | TUS | 80 | 22.50 | 99 | 21.21 | 1.29 |
+| SAN | DEN | 173 | 16.18 | 187 | 14.97 | 1.21 |
+| ONT | DEN | 64 | 15.62 | 97 | 14.43 | 1.19 |
+| DEN | PHL | 68 | 25.00 | 62 | 24.19 | 0.81 |
+| SAT | DEN | 100 | 17.00 | 104 | 16.35 | 0.65 |
+| DEN | LAX | 272 | 19.85 | 159 | 19.50 | 0.36 |
+| DEN | MIA | 96 | 22.92 | 31 | 22.58 | 0.34 |
+| IAD | PHX | 54 | 25.93 | 31 | 25.81 | 0.12 |
+| DEN | DSM | 62 | 19.35 | 31 | 19.35 | 0.00 |
+| DEN | OMA | 117 | 24.79 | 121 | 24.79 | -0.01 |
+| LAX | DEN | 272 | 11.40 | 155 | 11.61 | -0.22 |
+| CMH | DEN | 62 | 27.42 | 65 | 27.69 | -0.27 |
+| MSP | DEN | 117 | 17.95 | 128 | 18.75 | -0.80 |
+| LAX | LAS | 151 | 15.89 | 203 | 16.75 | -0.85 |
+| BNA | DEN | 101 | 13.86 | 163 | 14.72 | -0.86 |
+| PSP | DEN | 67 | 11.94 | 39 | 12.82 | -0.88 |
+| DEN | AUS | 142 | 23.24 | 174 | 24.14 | -0.90 |
+| DEN | IAD | 191 | 19.90 | 62 | 20.97 | -1.07 |
+| ORD | BNA | 55 | 12.73 | 50 | 14.00 | -1.27 |
+| DEN | TPA | 123 | 21.95 | 99 | 23.23 | -1.28 |
+| DEN | SAN | 170 | 19.41 | 187 | 20.86 | -1.44 |
+| SLC | DEN | 142 | 19.01 | 215 | 20.47 | -1.45 |
+| ATL | DEN | 79 | 17.72 | 93 | 19.35 | -1.63 |
+| DEN | GEG | 68 | 27.94 | 64 | 29.69 | -1.75 |
+| DEN | PHX | 252 | 17.86 | 313 | 20.13 | -2.27 |
+| PHX | DEN | 251 | 14.34 | 319 | 16.61 | -2.27 |
+| DEN | BUR | 63 | 20.63 | 96 | 22.92 | -2.28 |
+| DEN | FLL | 125 | 24.00 | 34 | 26.47 | -2.47 |
+| BWI | LAX | 34 | 11.76 | 35 | 14.29 | -2.52 |
+| SFO | LAX | 274 | 10.22 | 101 | 12.87 | -2.65 |
+| DEN | BOI | 87 | 24.14 | 89 | 26.97 | -2.83 |
+| SEA | DEN | 147 | 8.84 | 94 | 11.70 | -2.86 |
+| DEN | SFO | 301 | 21.26 | 124 | 24.19 | -2.93 |
+| AUS | DEN | 142 | 11.97 | 174 | 14.94 | -2.97 |
+| DEN | BOS | 140 | 17.14 | 68 | 20.59 | -3.45 |
+| MTJ | DEN | 92 | 20.65 | 41 | 24.39 | -3.74 |
+| PHX | IAD | 55 | 9.09 | 31 | 12.90 | -3.81 |
+| PIT | DEN | 62 | 24.19 | 39 | 28.21 | -4.01 |
+| DEN | DTW | 62 | 25.81 | 40 | 30.00 | -4.19 |
+| LGA | DEN | 163 | 14.72 | 116 | 18.97 | -4.24 |
+| SJC | DEN | 92 | 9.78 | 127 | 14.17 | -4.39 |
+| DEN | MCO | 147 | 19.73 | 161 | 24.22 | -4.50 |
+| DEN | SJC | 96 | 12.50 | 127 | 17.32 | -4.82 |
+| DEN | SDF | 49 | 18.37 | 30 | 23.33 | -4.97 |
+| DEN | SLC | 142 | 20.42 | 215 | 25.58 | -5.16 |
+| PHX | SFO | 122 | 7.38 | 94 | 12.77 | -5.39 |
+| LAX | SFO | 276 | 11.23 | 102 | 16.67 | -5.43 |
+| DEN | MEM | 60 | 26.67 | 31 | 32.26 | -5.59 |
+| SAN | SFO | 184 | 12.50 | 121 | 18.18 | -5.68 |
+| DEN | CVG | 59 | 13.56 | 31 | 19.35 | -5.80 |
+| DEN | BWI | 64 | 18.75 | 133 | 24.81 | -6.06 |
+| DEN | MSP | 118 | 19.49 | 125 | 25.60 | -6.11 |
+| SFO | SAN | 182 | 10.99 | 122 | 17.21 | -6.22 |
+| DEN | GRR | 62 | 19.35 | 31 | 25.81 | -6.45 |
+| DSM | DEN | 62 | 16.13 | 31 | 22.58 | -6.45 |
+| DEN | ATL | 80 | 17.50 | 96 | 23.96 | -6.46 |
+| DEN | BNA | 99 | 18.18 | 163 | 25.15 | -6.97 |
+| DEN | BZN | 121 | 30.58 | 71 | 38.03 | -7.45 |
+| DEN | ELP | 56 | 17.86 | 63 | 25.40 | -7.54 |
+| DEN | SMF | 126 | 17.46 | 140 | 25.00 | -7.54 |
+| SFO | DEN | 300 | 12.67 | 124 | 20.97 | -8.30 |
+| ORD | PHX | 164 | 10.37 | 32 | 18.75 | -8.38 |
+| PHX | LAX | 85 | 5.88 | 160 | 14.37 | -8.49 |
+| DEN | SEA | 146 | 19.86 | 94 | 28.72 | -8.86 |
+| DEN | IND | 61 | 16.39 | 96 | 26.04 | -9.65 |
+| LAS | LAX | 151 | 13.25 | 200 | 23.00 | -9.75 |
+| DEN | PDX | 147 | 23.13 | 108 | 33.33 | -10.20 |
+| PDX | DEN | 146 | 10.96 | 107 | 21.50 | -10.54 |
+| DEN | MTJ | 92 | 20.65 | 41 | 31.71 | -11.06 |
+| DEN | STL | 89 | 16.85 | 149 | 28.86 | -12.01 |
+| SFO | PHX | 121 | 9.09 | 94 | 21.28 | -12.19 |
+| FLL | DEN | 125 | 19.20 | 35 | 31.43 | -12.23 |
+| LAS | SFO | 201 | 12.94 | 107 | 25.23 | -12.30 |
+| DEN | CLE | 68 | 20.59 | 33 | 33.33 | -12.75 |
+| SMF | DEN | 127 | 8.66 | 138 | 21.74 | -13.08 |
+| SFO | LAS | 201 | 13.43 | 107 | 27.10 | -13.67 |
+| DEN | RDU | 62 | 16.13 | 59 | 30.51 | -14.38 |
+| DEN | MSY | 101 | 12.87 | 91 | 27.47 | -14.60 |
+| CVG | DEN | 59 | 13.56 | 31 | 29.03 | -15.47 |
+| LAS | ORD | 176 | 9.66 | 31 | 25.81 | -16.15 |
+| DEN | PIT | 62 | 19.35 | 39 | 35.90 | -16.54 |
+| DEN | CMH | 62 | 22.58 | 66 | 39.39 | -16.81 |
+| PHX | ORD | 167 | 9.58 | 32 | 28.12 | -18.54 |
+
+</details>
+
+<details>
+<summary>All 93 OH origin airports on the three peak days</summary>
+
+| Origin | Scheduled flights | Cancelled flights | Cancelled (%) |
+| --- | --- | --- | --- |
+| DCA | 366 | 259 | 70.77 |
+| CLT | 493 | 130 | 26.37 |
+| DFW | 114 | 20 | 17.54 |
+| PHL | 104 | 19 | 18.27 |
+| ATL | 30 | 17 | 56.67 |
+| HSV | 26 | 13 | 50.00 |
+| BNA | 25 | 13 | 52.00 |
+| BHM | 26 | 12 | 46.15 |
+| HPN | 24 | 11 | 45.83 |
+| TYS | 28 | 10 | 35.71 |
+| SAV | 30 | 10 | 33.33 |
+| CVG | 25 | 10 | 40.00 |
+| CAE | 19 | 10 | 52.63 |
+| CHS | 23 | 9 | 39.13 |
+| SDF | 13 | 9 | 69.23 |
+| GSP | 32 | 9 | 28.13 |
+| ORF | 28 | 9 | 32.14 |
+| PNS | 22 | 8 | 36.36 |
+| DAY | 31 | 8 | 25.81 |
+| CLE | 14 | 8 | 57.14 |
+| BUF | 11 | 8 | 72.73 |
+| MHT | 17 | 7 | 41.18 |
+| GSO | 19 | 6 | 31.58 |
+| ALB | 10 | 6 | 60.00 |
+| BGR | 9 | 6 | 66.67 |
+| ILM | 16 | 6 | 37.50 |
+| CHA | 16 | 6 | 37.50 |
+| SYR | 11 | 6 | 54.55 |
+| BTV | 17 | 6 | 35.29 |
+| LEX | 15 | 6 | 40.00 |
+| TUL | 14 | 6 | 42.86 |
+| PWM | 14 | 6 | 42.86 |
+| PVD | 11 | 6 | 54.55 |
+| BDL | 13 | 6 | 46.15 |
+| AVL | 15 | 6 | 40.00 |
+| SHV | 22 | 6 | 27.27 |
+| CRW | 11 | 6 | 54.55 |
+| MYR | 23 | 5 | 21.74 |
+| MSY | 7 | 5 | 71.43 |
+| PIT | 13 | 5 | 38.46 |
+| IAD | 13 | 5 | 38.46 |
+| DTW | 14 | 5 | 35.71 |
+| MEM | 13 | 5 | 38.46 |
+| LIT | 15 | 4 | 26.67 |
+| MSN | 11 | 4 | 36.36 |
+| ROC | 8 | 4 | 50.00 |
+| MSP | 10 | 4 | 40.00 |
+| DSM | 7 | 3 | 42.86 |
+| CMH | 15 | 3 | 20.00 |
+| GRR | 4 | 3 | 75.00 |
+| ICT | 10 | 3 | 30.00 |
+| MLB | 12 | 3 | 25.00 |
+| MKE | 7 | 3 | 42.86 |
+| SBN | 9 | 3 | 33.33 |
+| CAK | 15 | 3 | 20.00 |
+| GPT | 14 | 3 | 21.43 |
+| JAX | 7 | 3 | 42.86 |
+| XNA | 3 | 2 | 66.67 |
+| OKC | 4 | 2 | 50.00 |
+| AGS | 8 | 2 | 25.00 |
+| MCI | 5 | 2 | 40.00 |
+| RDU | 7 | 2 | 28.57 |
+| DAB | 12 | 2 | 16.67 |
+| JAN | 19 | 2 | 10.53 |
+| CID | 4 | 2 | 50.00 |
+| STL | 6 | 2 | 33.33 |
+| VPS | 11 | 2 | 18.18 |
+| TLH | 12 | 2 | 16.67 |
+| MGM | 8 | 2 | 25.00 |
+| RIC | 4 | 1 | 25.00 |
+| IND | 5 | 1 | 20.00 |
+| ABE | 9 | 1 | 11.11 |
+| BTR | 9 | 1 | 11.11 |
+| OMA | 3 | 1 | 33.33 |
+| LAN | 2 | 1 | 50.00 |
+| MLI | 6 | 1 | 16.67 |
+| PIA | 9 | 1 | 11.11 |
+| OAJ | 7 | 1 | 14.29 |
+| RSW | 2 | 1 | 50.00 |
+| AVP | 3 | 1 | 33.33 |
+| ECP | 6 | 1 | 16.67 |
+| IAH | 1 | 0 | 0.00 |
+| SRQ | 4 | 0 | 0.00 |
+| LFT | 8 | 0 | 0.00 |
+| BWI | 2 | 0 | 0.00 |
+| FWA | 6 | 0 | 0.00 |
+| HOU | 2 | 0 | 0.00 |
+| MOB | 2 | 0 | 0.00 |
+| FAY | 1 | 0 | 0.00 |
+| PBI | 1 | 0 | 0.00 |
+| SGF | 5 | 0 | 0.00 |
+| TRI | 1 | 0 | 0.00 |
+| GNV | 5 | 0 | 0.00 |
+
+</details>
+
